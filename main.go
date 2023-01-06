@@ -19,40 +19,43 @@ import (
 )
 
 const (
-	api         = "https://hq.xcc.edu.cn/rsp/site/DataCxlist"
-	proxyServer = "161.189.51.250:20029"
-	pageSize    = 100 // 每页的数据
+	api      = "https://hq.xcc.edu.cn/rsp/site/DataCxlist"
+	pageSize = 100 // 每页的数据
+	syncNum  = 5   // 并发数量
 )
 
 var (
-	rowCount = 0
-	proxyURL = &url.URL{}
+	rowCount  = 0
+	proxyPool = []string{
+		"http://161.189.51.250:20029",
+	}
 )
 
 func main() {
 
 	now := time.Now()
 
-	// 初始化代理
-	InitProxyURL()
-
 	// 获取第一页数据,获取rowCount
 	InitFirstPage()
 
+	// 初始化线程池
+	pool := New(syncNum)
+
 	// 向上取整
 	pageIndex := int(math.Ceil(float64(rowCount) / pageSize))
-	// 从第二页开始
-	wg := &sync.WaitGroup{}
-	for i := 2; i < pageIndex; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			if err := run(strconv.Itoa(i)); err != nil {
-				return
+
+	for i := 1; i <= pageIndex; i++ {
+		count := i
+		pool.wg.Add(1)
+		pool.NewTask(func() {
+			defer pool.wg.Done()
+			if err := run(strconv.Itoa(count)); err != nil {
+				log.Println(err)
 			}
-		}(i)
+		})
 	}
-	wg.Wait()
+
+	pool.wg.Wait()
 
 	fmt.Printf("==========爬取完成,总耗时:%v==========\n", time.Since(now))
 }
@@ -75,14 +78,27 @@ func InitFirstPage() {
 	}
 }
 
-// InitProxyURL 初始化代理
-func InitProxyURL() {
-	val, err := url.Parse("http://" + proxyServer)
+// run 启动程序
+func run(pageIndex string) error {
+	fmt.Printf("第%s个\n", pageIndex)
+	b, err := request(pageIndex)
 	if err != nil {
-		panic(err)
+		log.Printf("request err:%v", err)
+		return err
 	}
 
-	proxyURL = val
+	result, err := readHTMLValue(b, true)
+	if err != nil {
+		log.Printf("readHTMLValue err:%v", err)
+		return err
+	}
+
+	if err := writeFile(pageIndex, strconv.Itoa(pageSize), result); err != nil {
+		log.Printf("writeFile err:%v", err)
+		return err
+	}
+
+	return nil
 }
 
 // request 发起请求
@@ -104,7 +120,12 @@ func request(pageIndex string) ([]byte, error) {
 	request.Header.Add("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36")
 	request.Header.Add("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
 
-	client := &http.Client{Timeout: 5 * time.Minute, Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	result, _ := strconv.Atoi(pageIndex)
+	proxy := func(_ *http.Request) (*url.URL, error) {
+		return url.Parse(proxyPool[result%len(proxyPool)])
+	}
+
+	client := &http.Client{Timeout: 5 * time.Minute, Transport: &http.Transport{Proxy: proxy}}
 	resp, err := client.Do(request)
 	if err != nil {
 		return nil, err
@@ -172,24 +193,34 @@ func writeFile(page, pageSize string, b []byte) error {
 	return nil
 }
 
-// run 启动程序
-func run(pageIndex string) error {
-	b, err := request(pageIndex)
-	if err != nil {
-		log.Printf("request err:%v", err)
-		return err
-	}
+type Pool struct {
+	work chan func()   // 任务
+	sem  chan struct{} // 数量
+	wg   *sync.WaitGroup
+}
 
-	result, err := readHTMLValue(b, true)
-	if err != nil {
-		log.Printf("readHTMLValue err:%v", err)
-		return err
+func New(size int) *Pool {
+	return &Pool{
+		work: make(chan func()),
+		sem:  make(chan struct{}, size),
+		wg:   &sync.WaitGroup{},
 	}
+}
 
-	if err := writeFile(pageIndex, strconv.Itoa(pageSize), result); err != nil {
-		log.Printf("writeFile err:%v", err)
-		return err
+func (p *Pool) NewTask(task func()) {
+	select {
+	case p.work <- task:
+	case p.sem <- struct{}{}:
+		go p.worker(task)
 	}
+}
 
-	return nil
+func (p *Pool) worker(task func()) {
+	defer func() {
+		<-p.sem
+	}()
+	for {
+		task()
+		task = <-p.work
+	}
 }
